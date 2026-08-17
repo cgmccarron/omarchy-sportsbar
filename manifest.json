@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "sportsbar",
+  "name": "Sportsbar",
+  "version": "1.0.0",
+  "author": "christian",
+  "description": "Favorite team score & upcoming game pill with detail popup",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Sportsbar",
+    "description": "Favorite team score & upcoming game (NFL/NBA/NHL/MLB/Premier League/CFB/CBB)",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "colorizeTeams": true
+    },
+    "schema": [
+      {
+        "key": "colorizeTeams",
+        "type": "boolean",
+        "label": "Colorize team names",
+        "description": "Color each team's name (and accent bar) using the closest match to their brand color in the current theme.",
+        "defaultValue": true
+      }
+    ]
+  }
+}
