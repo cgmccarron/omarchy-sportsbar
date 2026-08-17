@@ -50,6 +50,20 @@ is ESPN's numeric team id (`bin/omarchy-sportsbar teams <sport>` lists them).
 omarchy plugin add https://github.com/cgmccarron/omarchy-sportsbar.git --enable
 ```
 
+## Removal
+
+```bash
+omarchy plugin remove sportsbar
+```
+
+This deletes `~/.config/omarchy/plugins/sportsbar/` and disables the widget.
+It does not clear your saved favorite teams or schedule cache; remove those
+too if you want a clean slate:
+
+```bash
+rm -rf ~/.local/state/omarchy/settings/sportsbar.json ~/.cache/omarchy/sportsbar
+```
+
 ## Dependencies
 
 Everything below ships with a stock Omarchy install — nothing extra to
