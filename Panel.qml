@@ -18,6 +18,13 @@ Panel {
   // Tailscale) read their settings inline for the same reason.
   readonly property bool colorizeTeams: root.settings.colorizeTeams !== false
 
+  // Absolute path to the bundled backend script (bin/omarchy-sportsbar next
+  // to this file). Resolved from this file's own URL rather than assumed on
+  // $PATH so the plugin works from any clone location with no separate
+  // install step -- required since `omarchy plugin add` only ever clones
+  // this repo and never runs install hooks.
+  readonly property string backendScript: decodeURIComponent(String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "")) + "bin/omarchy-sportsbar"
+
   property var anchorItem: null
   property bool openedFromHotkey: false
   property var hostWidget: null
@@ -92,7 +99,7 @@ Panel {
 
   Process {
     id: detailProc
-    command: ["bash", "-lc", "omarchy-sportsbar detail"]
+    command: [root.backendScript, "detail"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -113,7 +120,7 @@ Panel {
 
   Process {
     id: addTeamProc
-    command: ["bash", "-lc", "omarchy-sportsbar add"]
+    command: [root.backendScript, "add"]
     onExited: root.refresh()
   }
 
@@ -121,7 +128,7 @@ Panel {
 
   function runRemoveTeam(sport, teamId) {
     removingKey = sport + ":" + teamId
-    removeTeamProc.command = ["bash", "-lc", "omarchy-sportsbar remove-direct " + sport + " " + teamId]
+    removeTeamProc.command = [root.backendScript, "remove-direct", sport, teamId]
     removeTeamProc.running = true
   }
 

@@ -1,0 +1,436 @@
+#!/bin/bash
+
+# omarchy:summary=Manage favorite teams & show scores/upcoming games (Sportsbar plugin)
+#
+# Backend for the Sportsbar shell plugin. Talks to ESPN's public
+# site.api.espn.com JSON endpoints (no key required) to resolve teams and
+# their schedules. Tracks up to MAX_TEAMS favorite teams at once.
+#
+# State:  ~/.local/state/omarchy/settings/sportsbar.json
+#         {"teams":[{"sport":"nfl","teamId":"12","teamName":"Kansas City Chiefs","teamAbbrev":"KC"}, ...]}
+# Cache:  ~/.cache/omarchy/sportsbar/<sport>-<teamId>.json  (60s TTL per team)
+#
+# Commands:
+#   add                  interactive: pick a sport, then a team, and add it (max MAX_TEAMS)
+#   add-direct <s> <id>  add a team directly, no picker (id is the ESPN team id)
+#   remove                interactive: pick one of your favorite teams to remove
+#   remove-direct <s> <id> remove a team directly, no picker
+#   clear                forget all favorite teams
+#   current              print the saved state as JSON ({"teams":[]} if none)
+#   detail [--no-cache]  print {"teams":[{sport,teamId,teamName,teamAbbrev,label,current,upcoming}, ...]}
+#   sports               list sport labels and keys (tab-separated, for pickers)
+#   teams <sport>        list "Team Name<TAB>id" for a sport (sorted)
+
+set -euo pipefail
+
+STATE_FILE="$HOME/.local/state/omarchy/settings/sportsbar.json"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/sportsbar"
+CACHE_TTL=60
+MAX_TEAMS=6
+API="https://site.api.espn.com/apis/site/v2/sports"
+
+mkdir -p "$CACHE_DIR" "$(dirname "$STATE_FILE")"
+
+# sport key -> "ESPN path|display label"
+sport_meta() {
+  case "$1" in
+    nfl)  echo "football/nfl|NFL" ;;
+    nba)  echo "basketball/nba|NBA" ;;
+    nhl)  echo "hockey/nhl|NHL" ;;
+    mlb)  echo "baseball/mlb|MLB" ;;
+    prem) echo "soccer/eng.1|Premier League" ;;
+    cfb)  echo "football/college-football|College Football" ;;
+    cbb)  echo "basketball/mens-college-basketball|College Basketball" ;;
+    *) return 1 ;;
+  esac
+}
+
+espn_path() { sport_meta "$1" | cut -d'|' -f1; }
+espn_label() { sport_meta "$1" | cut -d'|' -f2; }
+
+# ---- Theme color matching. Each team keeps its real ESPN brand color, but
+# is displayed using whichever swatch in the *active* Omarchy theme is
+# closest to it -- so a team's accent always fits the current theme, and
+# switching themes re-colors every card without touching state.
+theme_colors_file() {
+  local name path
+  name=$(cat "$HOME/.local/state/omarchy/current/theme.name" 2>/dev/null || true)
+  [[ -n $name ]] || return
+  for path in "$HOME/.config/omarchy/themes/$name/colors.toml" "/usr/share/omarchy/themes/$name/colors.toml"; do
+    [[ -f $path ]] && { echo "$path"; return; }
+  done
+}
+
+# "<name><TAB><rrggbb>" lines for the current theme's swatches.
+theme_palette() {
+  local file
+  file=$(theme_colors_file) || return
+  [[ -n $file ]] || return
+  awk -F= '
+    { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2) }
+    $1 ~ /^(accent|red|orange|yellow|green|cyan|blue|magenta|brown|bright_red|bright_orange|bright_yellow|bright_green|bright_cyan|bright_blue|bright_magenta)$/ {
+      gsub(/["#]/, "", $2)
+      if ($2 ~ /^[0-9a-fA-F]{6}$/) print $1 "\t" $2
+    }
+  ' "$file"
+}
+
+# Nearest theme swatch (bare hex, no #) to a given "rrggbb" team color.
+nearest_theme_color() {
+  local team_hex="${1#\#}" palette
+  [[ $team_hex =~ ^[0-9a-fA-F]{6}$ ]] || return
+  palette=$(theme_palette) || return
+  [[ -n $palette ]] || return
+  # Matched by hue first (so a dark brand red still lands on the theme's
+  # "red", not whichever swatch happens to share its raw brightness),
+  # saturation second, and falls back to plain RGB distance for near-gray
+  # brand colors that have no meaningful hue.
+  awk -F'\t' -v target="$team_hex" '
+    function hexval(h) { return strtonum("0x" h) }
+    function max3(a,b,c) { m = a; if (b > m) m = b; if (c > m) m = c; return m }
+    function min3(a,b,c) { m = a; if (b < m) m = b; if (c < m) m = c; return m }
+    function hue(r,g,b,    mx,mn,d,h) {
+      mx = max3(r,g,b); mn = min3(r,g,b); d = mx - mn
+      if (d == 0) return -1
+      if (mx == r) h = 60 * (((g - b) / d) % 6)
+      else if (mx == g) h = 60 * (((b - r) / d) + 2)
+      else h = 60 * (((r - g) / d) + 4)
+      if (h < 0) h += 360
+      return h
+    }
+    function sat(r,g,b,    mx,mn) {
+      mx = max3(r,g,b); mn = min3(r,g,b)
+      if (mx == 0) return 0
+      return (mx - mn) / mx
+    }
+    BEGIN {
+      tr = hexval(substr(target,1,2)); tg = hexval(substr(target,3,2)); tb = hexval(substr(target,5,2))
+      th = hue(tr,tg,tb); ts = sat(tr,tg,tb)
+      best = -1
+    }
+    {
+      r = hexval(substr($2,1,2)); g = hexval(substr($2,3,2)); b = hexval(substr($2,5,2))
+      h = hue(r,g,b); s = sat(r,g,b)
+      if (th < 0 || h < 0) {
+        d = (r-tr)*(r-tr) + (g-tg)*(g-tg) + (b-tb)*(b-tb)
+      } else {
+        hd = th - h; if (hd < 0) hd = -hd; if (hd > 180) hd = 360 - hd
+        sd = ts - s; if (sd < 0) sd = -sd
+        d = hd*hd + sd*sd*900
+      }
+      if (best < 0 || d < best) { best = d; besthex = $2 }
+    }
+    END { if (besthex != "") print besthex }
+  ' <<<"$palette"
+}
+
+# omarchy-menu-select rows are "<icon><TAB><label><TAB><subtext>"; the icon
+# is never returned, and picking a row with a subtext returns
+# "<label><TAB><subtext>" -- the last tab field is always the stable key.
+# See /usr/share/omarchy/bin/omarchy-menu-select's header comment.
+cmd_sports() {
+  printf '\tNFL\tnfl\n'
+  printf '\tNBA\tnba\n'
+  printf '\tNHL\tnhl\n'
+  printf '\tMLB\tmlb\n'
+  printf '\tPremier League\tprem\n'
+  printf '\tCollege Football\tcfb\n'
+  printf '\tCollege Basketball\tcbb\n'
+}
+
+cmd_teams() {
+  local sport="$1" path
+  path=$(espn_path "$sport") || { echo "Unknown sport: $sport" >&2; exit 1; }
+  curl -fsS --max-time 8 "$API/$path/teams?limit=1000" \
+    | jq -r '.sports[0].leagues[0].teams[].team | [.displayName, .id] | @tsv' \
+    | sort
+}
+
+# ---- State (array of up to MAX_TEAMS teams), with a one-time migration from
+#      the old single-team object shape.
+read_state_teams() {
+  [[ -f $STATE_FILE ]] || { echo '[]'; return; }
+  if jq -e 'has("teams") and (.teams | type) == "array"' "$STATE_FILE" >/dev/null 2>&1; then
+    jq -c '.teams' "$STATE_FILE"
+  elif jq -e 'has("teamId")' "$STATE_FILE" >/dev/null 2>&1; then
+    jq -c '[{sport, teamId, teamName, teamAbbrev}]' "$STATE_FILE"
+  else
+    echo '[]'
+  fi
+}
+
+write_state_teams() {
+  jq -n --argjson teams "$1" '{teams: $teams}' >"$STATE_FILE"
+}
+
+cmd_add() {
+  local existing count sport sport_line teams team_line team_id
+
+  existing=$(read_state_teams)
+  count=$(jq 'length' <<<"$existing")
+  if (( count >= MAX_TEAMS )); then
+    omarchy-notification-send "Sportsbar" "You already have $MAX_TEAMS teams — remove one first"
+    exit 1
+  fi
+
+  sport_line=$(cmd_sports | omarchy-menu-select "Add team: pick a sport" -- --width 420) || exit 1
+  sport=$(printf '%s' "$sport_line" | awk -F'\t' '{print $NF}')
+  sport_meta "$sport" >/dev/null 2>&1 || { echo "Could not resolve sport from '$sport_line'" >&2; exit 1; }
+
+  teams=$(cmd_teams "$sport") || { omarchy-notification-send "Sportsbar" "Couldn't load $(espn_label "$sport") teams (network?)"; exit 1; }
+  [[ -n $teams ]] || { omarchy-notification-send "Sportsbar" "No teams found for $(espn_label "$sport")"; exit 1; }
+
+  # Plain names only (no ids shown); resolve the id via a local lookup after.
+  team_line=$(printf '%s\n' "$teams" | cut -f1 | omarchy-menu-select "Add team: pick a $(espn_label "$sport") team" -- --width 420 --maxheight 520) || exit 1
+  [[ -n $team_line ]] || exit 1
+  team_id=$(printf '%s\n' "$teams" | awk -F'\t' -v n="$team_line" '$1 == n {print $2; exit}')
+  [[ -n $team_id ]] || { echo "Could not resolve team id for '$team_line'" >&2; exit 1; }
+
+  cmd_add_direct "$sport" "$team_id"
+}
+
+# Raw ESPN brand color ("rrggbb", no #) for a team; empty on failure. Used
+# to backfill teamColor for favorites saved before that field existed.
+fetch_team_color() {
+  local sport="$1" team_id="$2" path info color
+  path=$(espn_path "$sport") || return
+  info=$(curl -fsS --max-time 8 "$API/$path/teams/$team_id") || return
+  color=$(jq -r '(.team.color // .team.alternateColor // "") | ascii_downcase' <<<"$info")
+  [[ $color =~ ^[0-9a-f]{6}$ ]] && printf '%s' "$color"
+}
+
+cmd_add_direct() {
+  local sport="$1" team_id="$2" path info name abbrev color existing count updated
+  path=$(espn_path "$sport") || { echo "Unknown sport: $sport" >&2; exit 1; }
+
+  info=$(curl -fsS --max-time 8 "$API/$path/teams/$team_id" | jq -c '.team | {name: .displayName, abbrev: .abbreviation, color: .color, alt: .alternateColor}')
+  name=$(jq -r '.name' <<<"$info")
+  abbrev=$(jq -r '.abbrev' <<<"$info")
+  color=$(jq -r '(.color // .alt // "") | ascii_downcase' <<<"$info")
+  [[ -n $name && $name != null ]] || { echo "Team $team_id not found for $sport" >&2; exit 1; }
+  [[ $color =~ ^[0-9a-f]{6}$ ]] || color=""
+
+  existing=$(read_state_teams)
+  if jq -e --arg sport "$sport" --arg id "$team_id" 'any(.[]; .sport == $sport and .teamId == $id)' <<<"$existing" >/dev/null; then
+    omarchy-notification-send "Sportsbar" "$name is already a favorite"
+    return 0
+  fi
+
+  count=$(jq 'length' <<<"$existing")
+  if (( count >= MAX_TEAMS )); then
+    omarchy-notification-send "Sportsbar" "You already have $MAX_TEAMS teams — remove one first"
+    exit 1
+  fi
+
+  updated=$(jq -c --arg sport "$sport" --arg teamId "$team_id" --arg teamName "$name" --arg teamAbbrev "$abbrev" --arg teamColor "$color" \
+    '. + [{sport: $sport, teamId: $teamId, teamName: $teamName, teamAbbrev: $teamAbbrev, teamColor: $teamColor}]' <<<"$existing")
+  write_state_teams "$updated"
+  rm -f "$CACHE_DIR/${sport}-${team_id}.json"
+  omarchy-notification-send "Sportsbar" "Added $name"
+}
+
+cmd_remove() {
+  local existing count i sport team_id name options=() line key
+
+  existing=$(read_state_teams)
+  count=$(jq 'length' <<<"$existing")
+  (( count > 0 )) || { omarchy-notification-send "Sportsbar" "No favorite teams to remove"; exit 1; }
+
+  for ((i = 0; i < count; i++)); do
+    sport=$(jq -r ".[$i].sport" <<<"$existing")
+    team_id=$(jq -r ".[$i].teamId" <<<"$existing")
+    name=$(jq -r ".[$i].teamName" <<<"$existing")
+    options+=("$(printf '\t%s (%s)\t%s|%s' "$name" "$(espn_label "$sport")" "$sport" "$team_id")")
+  done
+
+  line=$(printf '%s\n' "${options[@]}" | omarchy-menu-select "Remove favorite team" -- --width 420) || exit 1
+  key="${line##*$'\t'}"
+  sport="${key%%|*}"
+  team_id="${key#*|}"
+  [[ -n $sport && -n $team_id ]] || { echo "Could not resolve selection: '$line'" >&2; exit 1; }
+
+  cmd_remove_direct "$sport" "$team_id"
+}
+
+cmd_remove_direct() {
+  local sport="$1" team_id="$2" existing name updated
+  existing=$(read_state_teams)
+  name=$(jq -r --arg sport "$sport" --arg id "$team_id" '[.[] | select(.sport == $sport and .teamId == $id) | .teamName] | first // "Team"' <<<"$existing")
+  updated=$(jq -c --arg sport "$sport" --arg id "$team_id" '[.[] | select(.sport != $sport or .teamId != $id)]' <<<"$existing")
+  write_state_teams "$updated"
+  rm -f "$CACHE_DIR/${sport}-${team_id}.json"
+  omarchy-notification-send "Sportsbar" "Removed $name"
+}
+
+cmd_clear() {
+  write_state_teams '[]'
+  rm -f "$CACHE_DIR"/*.json
+  omarchy-notification-send "Sportsbar" "Cleared all favorite teams"
+}
+
+cmd_current() {
+  jq -n --argjson teams "$(read_state_teams)" '{teams: $teams}'
+}
+
+# One team's {sport,teamId,teamName,teamAbbrev,color,label,current,upcoming}:
+# the last/live game, the next game only if it falls within 14 days, and the
+# team's brand color snapped to the nearest swatch in the active theme. The
+# color is recomputed on every call (even cache hits) so a theme switch
+# re-colors cards immediately; only the schedule-derived fields are cached.
+team_detail_json() {
+  local sport="$1" team_id="$2" team_name="$3" team_abbrev="$4" team_color="$5" no_cache="$6"
+  local path cache_file base_json theme_hex
+
+  theme_hex=$(nearest_theme_color "$team_color" || true)
+
+  merge_color() {
+    jq -c --arg color "${theme_hex:+#$theme_hex}" '.color = ($color | if . == "" then null else . end)'
+  }
+
+  path=$(espn_path "$sport") || {
+    jq -cn --arg sport "$sport" --arg teamId "$team_id" --arg teamName "$team_name" --arg teamAbbrev "$team_abbrev" \
+      '{sport:$sport, teamId:$teamId, teamName:$teamName, teamAbbrev:$teamAbbrev, label:$teamAbbrev, current:null, upcoming:null}' | merge_color
+    return
+  }
+  cache_file="$CACHE_DIR/${sport}-${team_id}.json"
+
+  if [[ $no_cache == false && -f $cache_file ]]; then
+    local age=$(( $(date +%s) - $(stat -c %Y "$cache_file") ))
+    if (( age < CACHE_TTL )); then
+      merge_color <"$cache_file"
+      return
+    fi
+  fi
+
+  local schedule
+  if ! schedule=$(curl -fsS --max-time 8 "$API/$path/teams/$team_id/schedule"); then
+    # Network hiccup: fall back to stale cache rather than a blank entry.
+    if [[ -f $cache_file ]]; then
+      merge_color <"$cache_file"
+    else
+      jq -cn --arg sport "$sport" --arg teamId "$team_id" --arg teamName "$team_name" --arg teamAbbrev "$team_abbrev" \
+        '{sport:$sport, teamId:$teamId, teamName:$teamName, teamAbbrev:$teamAbbrev, label:$teamAbbrev, current:null, upcoming:null, error:"offline"}' | merge_color
+    fi
+    return
+  fi
+
+  base_json=$(jq -c --arg abbrev "$team_abbrev" --arg name "$team_name" --arg sport "$sport" --arg teamId "$team_id" \
+        --argjson now "$(date -u +%s)" '
+    def toepoch:
+      (if test("T\\d{2}:\\d{2}Z$") then sub("Z$"; ":00Z") else . end)
+      | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime;
+
+    def side($ev; $which): ($ev.competitions[0].competitors // []) | map(select(.homeAway == $which)) | first;
+
+    (.events // []) as $events
+    | (
+        [ $events[] | select(.competitions[0].status.type.state == "in" or .competitions[0].status.type.state == "post")
+          | select((.date | toepoch) <= $now) ]
+        | sort_by(.date) | last
+      ) as $cur
+    | (
+        [ $events[] | select(.competitions[0].status.type.state == "pre")
+          | select((((.date | toepoch) - $now)) as $d | $d >= -3600 and $d <= 14*86400) ]
+        | sort_by(.date) | first
+      ) as $nxt
+    | {
+        sport: $sport, teamId: $teamId, teamName: $name, teamAbbrev: $abbrev,
+        current: (
+          if $cur == null then null else
+            (side($cur;"home")) as $home
+            | (side($cur;"away")) as $away
+            | ($home.team.abbreviation == $abbrev) as $isHome
+            | (if $isHome then $home else $away end) as $me
+            | (if $isHome then $away else $home end) as $opp
+            | {
+                state: $cur.competitions[0].status.type.state,
+                detail: $cur.competitions[0].status.type.shortDetail,
+                isHome: $isHome,
+                opponent: $opp.team.abbreviation,
+                teamScore: ($me.score.displayValue // null),
+                opponentScore: ($opp.score.displayValue // null),
+                result: (if $cur.competitions[0].status.type.state == "post" then (if $me.winner == true then "W" elif $opp.winner == true then "L" else "T" end) else null end),
+                date: $cur.date
+              }
+          end
+        ),
+        upcoming: (
+          if $nxt == null then null else
+            (side($nxt;"home")) as $home2
+            | (side($nxt;"away")) as $away2
+            | ($home2.team.abbreviation == $abbrev) as $isHome2
+            | (if $isHome2 then $away2 else $home2 end) as $opp2
+            | {
+                isHome: $isHome2,
+                opponent: $opp2.team.abbreviation,
+                date: $nxt.date,
+                detail: $nxt.competitions[0].status.type.shortDetail,
+                daysAway: ((($nxt.date | toepoch) - $now) / 86400 | floor)
+              }
+          end
+        )
+      }
+    | .label = (
+        if .current == null then $abbrev
+        elif .current.state == "in" then "\($abbrev) \(.current.teamScore // "0")-\(.current.opponentScore // "0") \(.current.detail)"
+        else "\($abbrev) \(.current.result // "")\(if .current.result then " " else "" end)\(.current.teamScore // "0")-\(.current.opponentScore // "0")"
+        end
+      )
+  ' <<<"$schedule")
+
+  printf '%s' "$base_json" >"$cache_file"
+  merge_color <<<"$base_json"
+}
+
+cmd_detail() {
+  local no_cache=false
+  [[ ${1:-} == "--no-cache" ]] && no_cache=true
+
+  local teams count i sport team_id team_name team_abbrev team_color results=() dirty=false
+  teams=$(read_state_teams)
+  count=$(jq 'length' <<<"$teams")
+  if (( count == 0 )); then
+    echo '{"teams":[]}'
+    return
+  fi
+
+  for ((i = 0; i < count; i++)); do
+    sport=$(jq -r ".[$i].sport" <<<"$teams")
+    team_id=$(jq -r ".[$i].teamId" <<<"$teams")
+    team_name=$(jq -r ".[$i].teamName" <<<"$teams")
+    team_abbrev=$(jq -r ".[$i].teamAbbrev" <<<"$teams")
+    team_color=$(jq -r ".[$i].teamColor // \"\"" <<<"$teams")
+
+    # Favorites added before brand-color capture existed have no teamColor
+    # saved; backfill it once from ESPN so their cards stop rendering plain.
+    if [[ -z $team_color ]]; then
+      team_color=$(fetch_team_color "$sport" "$team_id" || true)
+      if [[ -n $team_color ]]; then
+        teams=$(jq -c --argjson i "$i" --arg color "$team_color" '.[$i].teamColor = $color' <<<"$teams")
+        dirty=true
+      fi
+    fi
+
+    results+=("$(team_detail_json "$sport" "$team_id" "$team_name" "$team_abbrev" "$team_color" "$no_cache")")
+  done
+
+  [[ $dirty == true ]] && write_state_teams "$teams"
+
+  printf '%s\n' "${results[@]}" | jq -s -c '{teams: .}'
+}
+
+case "${1:-}" in
+  add) cmd_add ;;
+  add-direct) shift; cmd_add_direct "$@" ;;
+  remove) cmd_remove ;;
+  remove-direct) shift; cmd_remove_direct "$@" ;;
+  clear) cmd_clear ;;
+  current) cmd_current ;;
+  detail) shift; cmd_detail "${1:-}" ;;
+  sports) cmd_sports ;;
+  teams) shift; cmd_teams "${1:-}" ;;
+  *)
+    echo "Usage: omarchy-sportsbar {add|add-direct <sport> <teamId>|remove|remove-direct <sport> <teamId>|clear|current|detail [--no-cache]|sports|teams <sport>}" >&2
+    exit 1
+    ;;
+esac
