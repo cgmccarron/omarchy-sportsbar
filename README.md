@@ -47,7 +47,7 @@ is ESPN's numeric team id (`bin/omarchy-sportsbar teams <sport>` lists them).
 ## Installation
 
 ```bash
-omarchy plugin add https://github.com/<your-username>/omarchy-sportsbar.git --enable
+omarchy plugin add https://github.com/cgmccarron/omarchy-sportsbar.git --enable
 ```
 
 ## Dependencies
