@@ -267,10 +267,45 @@ Panel {
                   anchors.right: removeButton.left
                   anchors.rightMargin: Style.space(8)
                   anchors.verticalCenter: parent.verticalCenter
-                  spacing: Style.space(2)
+                  spacing: Style.space(10)
+
+                  // Team logo: ASCII art (plain text, no color codes) when the
+                  // team was favorited with --ascii, otherwise the real logo
+                  // loaded straight from ESPN's CDN. Blank for favorites added
+                  // before this existed until the next detail refresh backfills
+                  // logoUrl.
+                  Item {
+                    id: logoBox
+                    width: Style.space(44)
+                    height: Style.space(44)
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Text {
+                      visible: !!card.modelData.logoAscii
+                      anchors.centerIn: parent
+                      text: card.modelData.logoAscii || ""
+                      color: card.accentColor
+                      font.family: "monospace"
+                      font.pixelSize: 5
+                      lineHeight: 0.85
+                      lineHeightMode: Text.ProportionalHeight
+                    }
+
+                    Image {
+                      visible: !card.modelData.logoAscii && !!card.modelData.logoUrl
+                      anchors.centerIn: parent
+                      width: parent.width
+                      height: parent.height
+                      source: card.modelData.logoUrl || ""
+                      fillMode: Image.PreserveAspectFit
+                      asynchronous: true
+                      cache: true
+                      smooth: true
+                    }
+                  }
 
                   Column {
-                    width: parent.width - (scoreText.visible ? scoreText.implicitWidth + Style.space(14) : 0)
+                    width: parent.width - logoBox.width - heroRow.spacing - (scoreText.visible ? scoreText.implicitWidth + Style.space(14) : 0)
                     spacing: Style.space(2)
 
                     Text {
@@ -284,9 +319,8 @@ Panel {
                     }
                     Text {
                       text: card.current
-                        ? (card.current.state === "in"
-                            ? "Live · " + (card.current.detail || "")
-                            : (card.current.isHome ? "vs " : "@ ") + (card.current.opponent || "") + " · " + (card.current.detail || ""))
+                        ? (card.current.state === "in" ? "Live · " : "")
+                          + (card.current.isHome ? "vs " : "@ ") + (card.current.opponent || "") + " · " + (card.current.detail || "")
                         : "No recent game"
                       color: Qt.darker(root.bar.foreground, 1.4)
                       font.family: root.bar.fontFamily

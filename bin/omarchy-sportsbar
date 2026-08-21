@@ -7,19 +7,27 @@
 # their schedules. Tracks up to MAX_TEAMS favorite teams at once.
 #
 # State:  ~/.local/state/omarchy/settings/sportsbar.json
-#         {"teams":[{"sport":"nfl","teamId":"12","teamName":"Kansas City Chiefs","teamAbbrev":"KC"}, ...]}
+#         {"teams":[{"sport":"nfl","teamId":"12","teamName":"Kansas City Chiefs","teamAbbrev":"KC",
+#                    "teamLogoUrl":"https://...png","teamLogoAscii":null}, ...]}
+#         teamLogoAscii is only set when the team was added with --ascii; otherwise the popup
+#         renders the real logo from teamLogoUrl.
 # Cache:  ~/.cache/omarchy/sportsbar/<sport>-<teamId>.json  (60s TTL per team)
 #
 # Commands:
-#   add                  interactive: pick a sport, then a team, and add it (max MAX_TEAMS)
-#   add-direct <s> <id>  add a team directly, no picker (id is the ESPN team id)
+#   add [--ascii]                  interactive: pick a sport, then a team, and add it (max MAX_TEAMS)
+#   add-direct <s> <id> [--ascii]  add a team directly, no picker (id is the ESPN team id)
 #   remove                interactive: pick one of your favorite teams to remove
 #   remove-direct <s> <id> remove a team directly, no picker
 #   clear                forget all favorite teams
 #   current              print the saved state as JSON ({"teams":[]} if none)
-#   detail [--no-cache]  print {"teams":[{sport,teamId,teamName,teamAbbrev,label,current,upcoming}, ...]}
+#   detail [--no-cache]  print {"teams":[{sport,teamId,teamName,teamAbbrev,label,current,upcoming,logoUrl,logoAscii}, ...]}
 #   sports               list sport labels and keys (tab-separated, for pickers)
 #   teams <sport>        list "Team Name<TAB>id" for a sport (sorted)
+#
+# --ascii renders the team's logo as plain-text ASCII art (via img2txt +
+# ImageMagick) and stores it instead of the logo URL. Requires caca-utils
+# (img2txt) and ImageMagick; falls back to the real logo if either is
+# missing or the render fails.
 
 set -euo pipefail
 
@@ -28,6 +36,7 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/sportsbar"
 CACHE_TTL=60
 MAX_TEAMS=6
 API="https://site.api.espn.com/apis/site/v2/sports"
+ASCII_WIDTH=24
 
 mkdir -p "$CACHE_DIR" "$(dirname "$STATE_FILE")"
 
@@ -48,6 +57,34 @@ sport_meta() {
 espn_path() { sport_meta "$1" | cut -d'|' -f1; }
 espn_label() { sport_meta "$1" | cut -d'|' -f2; }
 
+# Render a team logo URL as plain-text ASCII art (no ANSI color codes --
+# just the glyphs img2txt picks, so it's a single Text item in QML). Prints
+# nothing and returns non-zero if img2txt/imagemagick are missing or
+# anything along the way fails.
+logo_to_ascii() {
+  local url="$1" tmp_src tmp_flat art
+  [[ -n $url ]] || return 1
+  command -v img2txt >/dev/null 2>&1 || return 1
+  command -v magick >/dev/null 2>&1 || command -v convert >/dev/null 2>&1 || return 1
+
+  tmp_src=$(mktemp --suffix=.png)
+  tmp_flat=$(mktemp --suffix=.png)
+  trap 'rm -f "$tmp_src" "$tmp_flat"' RETURN
+
+  curl -fsS --max-time 8 "$url" -o "$tmp_src" || return 1
+  # Logos are transparent PNGs; flatten onto white first so img2txt doesn't
+  # render the transparent background as solid black.
+  if command -v magick >/dev/null 2>&1; then
+    magick "$tmp_src" -background white -alpha remove -alpha off "$tmp_flat" || return 1
+  else
+    convert "$tmp_src" -background white -alpha remove -alpha off "$tmp_flat" || return 1
+  fi
+
+  art=$(img2txt -W "$ASCII_WIDTH" -f utf8 "$tmp_flat" 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g') || return 1
+  [[ -n $art ]] || return 1
+  printf '%s' "$art"
+}
+
 # ---- Theme color matching. Each team keeps its real ESPN brand color, but
 # is displayed using whichever swatch in the *active* Omarchy theme is
 # closest to it -- so a team's accent always fits the current theme, and
@@ -66,11 +103,24 @@ theme_palette() {
   local file
   file=$(theme_colors_file) || return
   [[ -n $file ]] || return
+  # Themes name their swatches one of two ways: hue words (red, blue, ...)
+  # or a plain ANSI color0..color15 ramp (e.g. ame-quattro). Map the ANSI
+  # slots that correspond to a real hue onto the same hue words so both
+  # schemes feed the same matcher below.
   awk -F= '
-    { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2) }
-    $1 ~ /^(accent|red|orange|yellow|green|cyan|blue|magenta|brown|bright_red|bright_orange|bright_yellow|bright_green|bright_cyan|bright_blue|bright_magenta)$/ {
+    BEGIN {
+      ansi["color1"]="red"; ansi["color2"]="green"; ansi["color3"]="yellow"; ansi["color4"]="blue"
+      ansi["color5"]="magenta"; ansi["color6"]="cyan"
+      ansi["color9"]="bright_red"; ansi["color10"]="bright_green"; ansi["color11"]="bright_yellow"
+      ansi["color12"]="bright_blue"; ansi["color13"]="bright_magenta"; ansi["color14"]="bright_cyan"
+    }
+    {
+      gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2)
+      key = ($1 in ansi) ? ansi[$1] : $1
+    }
+    key ~ /^(accent|red|orange|yellow|green|cyan|blue|magenta|brown|bright_red|bright_orange|bright_yellow|bright_green|bright_cyan|bright_blue|bright_magenta)$/ {
       gsub(/["#]/, "", $2)
-      if ($2 ~ /^[0-9a-fA-F]{6}$/) print $1 "\t" $2
+      if ($2 ~ /^[0-9a-fA-F]{6}$/) print key "\t" $2
     }
   ' "$file"
 }
@@ -164,6 +214,7 @@ write_state_teams() {
 }
 
 cmd_add() {
+  local ascii_flag="${1:-}"
   local existing count sport sport_line teams team_line team_id
 
   existing=$(read_state_teams)
@@ -186,7 +237,7 @@ cmd_add() {
   team_id=$(printf '%s\n' "$teams" | awk -F'\t' -v n="$team_line" '$1 == n {print $2; exit}')
   [[ -n $team_id ]] || { echo "Could not resolve team id for '$team_line'" >&2; exit 1; }
 
-  cmd_add_direct "$sport" "$team_id"
+  cmd_add_direct "$sport" "$team_id" "$ascii_flag"
 }
 
 # Raw ESPN brand color ("rrggbb", no #) for a team; empty on failure. Used
@@ -199,14 +250,24 @@ fetch_team_color() {
   [[ $color =~ ^[0-9a-f]{6}$ ]] && printf '%s' "$color"
 }
 
+# Default-rel logo URL for a team; empty on failure. Used to backfill
+# teamLogoUrl for favorites saved before that field existed.
+fetch_team_logo() {
+  local sport="$1" team_id="$2" path info
+  path=$(espn_path "$sport") || return
+  info=$(curl -fsS --max-time 8 "$API/$path/teams/$team_id") || return
+  jq -r '([.team.logos[]? | select(.rel | index("default"))][0].href // .team.logos[0].href // "")' <<<"$info"
+}
+
 cmd_add_direct() {
-  local sport="$1" team_id="$2" path info name abbrev color existing count updated
+  local sport="$1" team_id="$2" ascii_flag="${3:-}" path info name abbrev color logo_url ascii_art existing count updated
   path=$(espn_path "$sport") || { echo "Unknown sport: $sport" >&2; exit 1; }
 
-  info=$(curl -fsS --max-time 8 "$API/$path/teams/$team_id" | jq -c '.team | {name: .displayName, abbrev: .abbreviation, color: .color, alt: .alternateColor}')
+  info=$(curl -fsS --max-time 8 "$API/$path/teams/$team_id" | jq -c '.team | {name: .displayName, abbrev: .abbreviation, color: .color, alt: .alternateColor, logo: ([.logos[]? | select(.rel | index("default"))][0].href // .logos[0].href // null)}')
   name=$(jq -r '.name' <<<"$info")
   abbrev=$(jq -r '.abbrev' <<<"$info")
   color=$(jq -r '(.color // .alt // "") | ascii_downcase' <<<"$info")
+  logo_url=$(jq -r '.logo // ""' <<<"$info")
   [[ -n $name && $name != null ]] || { echo "Team $team_id not found for $sport" >&2; exit 1; }
   [[ $color =~ ^[0-9a-f]{6}$ ]] || color=""
 
@@ -222,8 +283,17 @@ cmd_add_direct() {
     exit 1
   fi
 
+  ascii_art=""
+  if [[ $ascii_flag == "--ascii" ]]; then
+    ascii_art=$(logo_to_ascii "$logo_url" || true)
+    [[ -n $ascii_art ]] || omarchy-notification-send "Sportsbar" "Couldn't render $name logo as ASCII; showing the real logo instead"
+  fi
+
   updated=$(jq -c --arg sport "$sport" --arg teamId "$team_id" --arg teamName "$name" --arg teamAbbrev "$abbrev" --arg teamColor "$color" \
-    '. + [{sport: $sport, teamId: $teamId, teamName: $teamName, teamAbbrev: $teamAbbrev, teamColor: $teamColor}]' <<<"$existing")
+    --arg teamLogoUrl "$logo_url" --arg teamLogoAscii "$ascii_art" \
+    '. + [{sport: $sport, teamId: $teamId, teamName: $teamName, teamAbbrev: $teamAbbrev, teamColor: $teamColor,
+           teamLogoUrl: ($teamLogoUrl | if . == "" then null else . end),
+           teamLogoAscii: ($teamLogoAscii | if . == "" then null else . end)}]' <<<"$existing")
   write_state_teams "$updated"
   rm -f "$CACHE_DIR/${sport}-${team_id}.json"
   omarchy-notification-send "Sportsbar" "Added $name"
@@ -343,6 +413,7 @@ team_detail_json() {
             | (if $isHome then $home else $away end) as $me
             | (if $isHome then $away else $home end) as $opp
             | {
+                id: $cur.id,
                 state: $cur.competitions[0].status.type.state,
                 detail: $cur.competitions[0].status.type.shortDetail,
                 isHome: $isHome,
@@ -370,13 +441,36 @@ team_detail_json() {
           end
         )
       }
+  ' <<<"$schedule")
+
+  # The /schedule endpoint has no score field at all while a game is live
+  # (only once it's "post"), so pull the live score from the summary
+  # endpoint and patch it in.
+  local cur_state cur_id
+  cur_state=$(jq -r '.current.state // empty' <<<"$base_json")
+  cur_id=$(jq -r '.current.id // empty' <<<"$base_json")
+  if [[ $cur_state == "in" && -n $cur_id ]]; then
+    local live
+    if live=$(curl -fsS --max-time 8 "$API/$path/summary?event=$cur_id"); then
+      base_json=$(jq -c --slurpfile live <(printf '%s' "$live") --arg abbrev "$team_abbrev" '
+        ($live[0].header.competitions[0].competitors // []) as $lc
+        | (($lc[] | select(.team.abbreviation == $abbrev) | .score)) as $ls
+        | (($lc[] | select(.team.abbreviation != $abbrev) | .score)) as $os
+        | .current.teamScore = ($ls // .current.teamScore)
+        | .current.opponentScore = ($os // .current.opponentScore)
+      ' <<<"$base_json")
+    fi
+  fi
+
+  base_json=$(jq -c '
+    del(.current.id)
     | .label = (
-        if .current == null then $abbrev
-        elif .current.state == "in" then "\($abbrev) \(.current.teamScore // "0")-\(.current.opponentScore // "0") \(.current.detail)"
-        else "\($abbrev) \(.current.result // "")\(if .current.result then " " else "" end)\(.current.teamScore // "0")-\(.current.opponentScore // "0")"
+        if .current == null then .teamAbbrev
+        elif .current.state == "in" then "\(.teamAbbrev) \(.current.teamScore // "0")-\(.current.opponentScore // "0") \(.current.detail)"
+        else "\(.teamAbbrev) \(.current.result // "")\(if .current.result then " " else "" end)\(.current.teamScore // "0")-\(.current.opponentScore // "0")"
         end
       )
-  ' <<<"$schedule")
+  ' <<<"$base_json")
 
   printf '%s' "$base_json" >"$cache_file"
   merge_color <<<"$base_json"
@@ -386,7 +480,7 @@ cmd_detail() {
   local no_cache=false
   [[ ${1:-} == "--no-cache" ]] && no_cache=true
 
-  local teams count i sport team_id team_name team_abbrev team_color results=() dirty=false
+  local teams count i sport team_id team_name team_abbrev team_color logo_url logo_ascii detail results=() dirty=false
   teams=$(read_state_teams)
   count=$(jq 'length' <<<"$teams")
   if (( count == 0 )); then
@@ -400,9 +494,11 @@ cmd_detail() {
     team_name=$(jq -r ".[$i].teamName" <<<"$teams")
     team_abbrev=$(jq -r ".[$i].teamAbbrev" <<<"$teams")
     team_color=$(jq -r ".[$i].teamColor // \"\"" <<<"$teams")
+    logo_ascii=$(jq -r ".[$i].teamLogoAscii // \"\"" <<<"$teams")
+    logo_url=$(jq -r ".[$i].teamLogoUrl // \"\"" <<<"$teams")
 
-    # Favorites added before brand-color capture existed have no teamColor
-    # saved; backfill it once from ESPN so their cards stop rendering plain.
+    # Favorites added before brand-color/logo capture existed have neither
+    # saved; backfill them once from ESPN so their cards stop rendering plain.
     if [[ -z $team_color ]]; then
       team_color=$(fetch_team_color "$sport" "$team_id" || true)
       if [[ -n $team_color ]]; then
@@ -410,8 +506,18 @@ cmd_detail() {
         dirty=true
       fi
     fi
+    if [[ -z $logo_url && -z $logo_ascii ]]; then
+      logo_url=$(fetch_team_logo "$sport" "$team_id" || true)
+      if [[ -n $logo_url ]]; then
+        teams=$(jq -c --argjson i "$i" --arg logo "$logo_url" '.[$i].teamLogoUrl = $logo' <<<"$teams")
+        dirty=true
+      fi
+    fi
 
-    results+=("$(team_detail_json "$sport" "$team_id" "$team_name" "$team_abbrev" "$team_color" "$no_cache")")
+    detail=$(team_detail_json "$sport" "$team_id" "$team_name" "$team_abbrev" "$team_color" "$no_cache")
+    detail=$(jq -c --arg logoUrl "$logo_url" --arg logoAscii "$logo_ascii" \
+      '.logoUrl = ($logoUrl | if . == "" then null else . end) | .logoAscii = ($logoAscii | if . == "" then null else . end)' <<<"$detail")
+    results+=("$detail")
   done
 
   [[ $dirty == true ]] && write_state_teams "$teams"
@@ -420,7 +526,7 @@ cmd_detail() {
 }
 
 case "${1:-}" in
-  add) cmd_add ;;
+  add) shift; cmd_add "${1:-}" ;;
   add-direct) shift; cmd_add_direct "$@" ;;
   remove) cmd_remove ;;
   remove-direct) shift; cmd_remove_direct "$@" ;;
@@ -430,7 +536,7 @@ case "${1:-}" in
   sports) cmd_sports ;;
   teams) shift; cmd_teams "${1:-}" ;;
   *)
-    echo "Usage: omarchy-sportsbar {add|add-direct <sport> <teamId>|remove|remove-direct <sport> <teamId>|clear|current|detail [--no-cache]|sports|teams <sport>}" >&2
+    echo "Usage: omarchy-sportsbar {add [--ascii]|add-direct <sport> <teamId> [--ascii]|remove|remove-direct <sport> <teamId>|clear|current|detail [--no-cache]|sports|teams <sport>}" >&2
     exit 1
     ;;
 esac
