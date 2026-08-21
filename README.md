@@ -2,15 +2,22 @@
 
 A bar widget for the [Omarchy](https://omarchy.org/) shell that tracks your
 favorite sports teams. Pick up to 6 teams and the trophy pill in your bar
-opens a popup showing each team's latest score/result and next upcoming
+opens a popup showing each team's live/latest score and next upcoming
 game, pulled from ESPN's public API — no account or key required.
+
+![Sportsbar popup showing four favorite teams with logos, scores, and next games](preview.png)
 
 Supported sports: NFL, NBA, NHL, MLB, Premier League, College Football,
 College Basketball.
 
-Each team's card is accented with its real brand color, automatically
-snapped to the nearest swatch in whatever Omarchy theme is active, so it
-never clashes and re-colors itself on a theme switch.
+- **Live scores**: in-progress games show the current score and game state
+  (e.g. "Top 9th", "Q3 4:12"), not just final results.
+- **Team logos**: each card shows the team's real logo, or — if you added
+  the team with `--ascii` — a plain-text ASCII rendering of it.
+- **Theme-matched colors**: each team's card is accented with its real
+  brand color, automatically snapped to the nearest swatch in whatever
+  Omarchy theme is active, so it never clashes and re-colors itself on a
+  theme switch.
 
 ## Settings
 
@@ -34,8 +41,9 @@ The same actions are available from the command line via the bundled
 
 ```bash
 bin/omarchy-sportsbar add                    # interactive: pick sport, then team
+bin/omarchy-sportsbar add --ascii            # same, but store an ASCII-art logo instead of the real one
 bin/omarchy-sportsbar remove                 # interactive: pick a favorite to remove
-bin/omarchy-sportsbar add-direct <sport> <teamId>
+bin/omarchy-sportsbar add-direct <sport> <teamId> [--ascii]
 bin/omarchy-sportsbar remove-direct <sport> <teamId>
 bin/omarchy-sportsbar clear                  # forget all favorites
 bin/omarchy-sportsbar detail                 # print current state as JSON
@@ -43,6 +51,11 @@ bin/omarchy-sportsbar detail                 # print current state as JSON
 
 `sport` is one of `nfl`, `nba`, `nhl`, `mlb`, `prem`, `cfb`, `cbb`; `teamId`
 is ESPN's numeric team id (`bin/omarchy-sportsbar teams <sport>` lists them).
+
+`--ascii` renders the team's logo as plain-text ASCII art at add time and
+stores it instead of the logo URL, so the card shows the ASCII version
+from then on. Requires `img2txt` (from `caca-utils`) and ImageMagick; if
+either is missing, or the render fails, it falls back to the real logo.
 
 ## Installation
 
@@ -72,6 +85,11 @@ install:
 - `bash`, `curl`, `jq`
 - `omarchy-menu-select` and `omarchy-notification-send` (Omarchy's own
   picker/notification helpers, used for the interactive add/remove flows)
+
+Optional, only needed for `--ascii`:
+
+- `img2txt` (from the `caca-utils` package)
+- ImageMagick (`magick` or `convert`)
 
 ## Data & storage
 

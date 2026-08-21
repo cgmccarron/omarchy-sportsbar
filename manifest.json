@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "sportsbar",
   "name": "Sportsbar",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "christian",
   "description": "Favorite team score & upcoming game pill with detail popup",
   "kinds": [
